@@ -8,6 +8,7 @@ let package = Package(
     targets: [
         .target(name: "GrammyCore"),
         .executableTarget(name: "Grammy", dependencies: ["GrammyCore"]),
+        .testTarget(name: "GrammyTests", dependencies: ["Grammy", "GrammyCore"]),
         .testTarget(name: "GrammyCoreTests", dependencies: ["GrammyCore"], resources: [.copy("Fixtures")])
     ],
     swiftLanguageModes: [.v5]

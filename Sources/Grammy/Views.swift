@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import GrammyCore
 
 struct RewriteView: View {
     @ObservedObject var model: RewriteModel
@@ -26,22 +27,17 @@ struct RewriteView: View {
                 VStack(alignment: .leading, spacing: 10) {
                     label("ORIGINAL", icon: "text.alignleft")
                     if model.hasTarget || model.isSample {
-                        ScrollView {
-                            Text(model.original).textSelection(.enabled)
-                                .frame(maxWidth: .infinity, alignment: .topLeading).padding(14)
-                        }.frame(maxWidth: .infinity, maxHeight: .infinity)
+                        FormattedEditor(value: model.originalFormat, original: model.original)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
                             .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 12))
                     } else {
-                        TextEditor(text: $model.original)
-                            .scrollContentBackground(.hidden).padding(8)
+                        FormattedEditor(value: model.originalFormat, original: model.original,
+                                        editable: !model.isBusy && !model.isReplacing,
+                                        onEdit: { model.editOriginal($0) })
                             .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 12))
-                            .disabled(model.isBusy)
-                            .onChange(of: model.original) { _, _ in
-                                model.isComplete = false; model.suggestion = ""; model.error = nil
-                            }
                             .overlay(alignment: .topLeading) {
                                 if model.original.isEmpty {
-                                    Text("Paste a message here, or select text in Slack and use Services → Improve Slack message.")
+                                    Text("Paste a message here, or select text in Slack and use Services → Grammy: Improve message.")
                                         .foregroundStyle(.tertiary).padding(14).allowsHitTesting(false)
                                 }
                             }
@@ -54,8 +50,9 @@ struct RewriteView: View {
                         if model.isSample { Text("SAMPLE").font(.caption2.weight(.semibold)).foregroundStyle(.secondary) }
                         if model.isBusy { ProgressView().controlSize(.small) }
                     }
-                    TextEditor(text: $model.suggestion)
-                        .scrollContentBackground(.hidden).padding(8)
+                    FormattedEditor(value: model.formattedSuggestion, original: model.original,
+                                    highlight: true, editable: model.isComplete && !model.isBusy && !model.isReplacing,
+                                    onEdit: { model.suggestion = $0 })
                         .background(accent.opacity(0.045), in: RoundedRectangle(cornerRadius: 12))
                         .overlay(RoundedRectangle(cornerRadius: 12).stroke(accent.opacity(0.2), lineWidth: 1))
                         .disabled(model.isBusy || !model.isComplete || model.isReplacing)
@@ -79,7 +76,8 @@ struct RewriteView: View {
             }
             HStack(spacing: 10) {
                 Text(model.isSample ? "Sample preview · No request sent" :
-                        (model.providerName.isEmpty ? "Only the text you choose is sent." : "Rewriting with \(model.providerName)"))
+                        (model.providerName.isEmpty ? "Only the text you choose is sent." :
+                         (model.isBusy ? "Rewriting with \(model.providerName)" : "Suggestion from \(model.providerName)")))
                     .font(.caption).foregroundStyle(.secondary)
                 Spacer()
                 Button("Cancel") { model.cancel() }.keyboardShortcut(.cancelAction)
@@ -174,7 +172,7 @@ struct SettingsView: View {
             } header: { Text("Google AI Studio fallback") }
 
             Section {
-                Text("Select text in Slack, right-click, and look under Services for Improve Slack message. Menu placement depends on Slack.")
+                Text("Select text in an editor, right-click, and look under Services for Grammy: Improve message. Menu placement depends on the app.")
                 LabeledContent("Global shortcut", value: "⌃⌥⌘G")
                 HStack {
                     Button("Accessibility settings") {
@@ -184,14 +182,14 @@ struct SettingsView: View {
                         NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.Keyboard-Settings.extension")!)
                     }
                 }
-                Text("The shortcut needs Accessibility permission. Services can work without it. In Keyboard → Keyboard Shortcuts → Services, enable Grammy’s action if it is hidden.")
+                Text("Accessibility is needed for the shortcut, Slack emoji images, and Replace. Complete Services text can still be improved and copied without it. In Keyboard → Keyboard Shortcuts → Services, enable Grammy’s action if it is hidden.")
                     .font(.caption).foregroundStyle(.secondary)
             } header: { Text("Use in Slack and other apps") }
 
             Section {
                 Text("Grammy sends your selected text to ChatGPT, or to Gemini when fallback is enabled and needed, only when you request a rewrite or regenerate. Drafts and suggestions stay in memory; credentials are stored in Keychain.")
                     .font(.callout)
-                Text("This prototype inserts plain text. Review Slack mentions, links, formatting and custom emojis after replacing. It never presses Send.")
+                Text("Inline code, bold, italics and links are preserved when the editor provides rich text. Yellow highlights show changed wording and are never pasted. Review the result before sending; Grammy never presses Send.")
                     .font(.caption).foregroundStyle(.secondary)
                 Button("Show sample preview") { sample() }
             } header: { Text("Personal prototype") }

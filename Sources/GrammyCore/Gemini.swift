@@ -47,7 +47,7 @@ public enum Gemini {
         var contents: [[String: Any]] = [["role": "user", "parts": [["text": original]]]]
         if let previous, !previous.isEmpty {
             contents += [["role": "model", "parts": [["text": previous]]],
-                         ["role": "user", "parts": [["text": Rewrite.alternativeInstruction]]]]
+                         ["role": "user", "parts": [["text": Rewrite.followUpInstruction(original: original, previous: previous)]]]]
         }
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
