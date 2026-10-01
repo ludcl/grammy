@@ -69,7 +69,24 @@ final class GeminiAccount: ObservableObject {
 
     func rewrite(original: String, previous: String?) async throws -> String {
         try Task.checkCancellation()
-        var query = self.query
+        // macOS may ask to authorize a newly signed build. Keep that Keychain
+        // wait off MainActor so the preview and Cancel stay responsive.
+        let key = try await Task.detached(priority: .userInitiated) { try Self.readKey() }.value
+        try Task.checkCancellation()
+        let request = try Gemini.request(original: original, previous: previous, apiKey: key)
+        let (responseData, response) = try await session.data(for: request)
+        try Task.checkCancellation()
+        let text = try Gemini.response(responseData, status: (response as? HTTPURLResponse)?.statusCode ?? 0)
+        try Rewrite.validate(original: original, candidate: text)
+        return text
+    }
+
+    private nonisolated static func readKey() throws -> String {
+        var query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "local.grammy.gemini",
+            kSecAttrAccount as String: "api-key"
+        ]
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
         var result: CFTypeRef?
@@ -77,13 +94,7 @@ final class GeminiAccount: ObservableObject {
         guard status == errSecSuccess, let data = result as? Data, let key = String(data: data, encoding: .utf8) else {
             throw GrammyError("Could not read the Gemini key. Save it again in Settings or unlock your Keychain.")
         }
-        let request = try Gemini.request(original: original, previous: previous, apiKey: key)
-        try Task.checkCancellation()
-        let (responseData, response) = try await session.data(for: request)
-        try Task.checkCancellation()
-        let text = try Gemini.response(responseData, status: (response as? HTTPURLResponse)?.statusCode ?? 0)
-        try Rewrite.validate(original: original, candidate: text)
-        return text
+        return key
     }
 
     func testConnection() {

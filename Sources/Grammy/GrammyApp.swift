@@ -1,5 +1,7 @@
 import AppKit
+import ApplicationServices
 import SwiftUI
+import OSLog
 import GrammyCore
 
 @main
@@ -16,23 +18,38 @@ enum GrammyMain {
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
-    private let account = ChatGPTAccount()
-    private let gemini = GeminiAccount()
-    private lazy var model = RewriteModel(account: account, gemini: gemini)
+    typealias CapturedService = (text: FormattedText, source: String, replace: (FormattedText) async throws -> Void)
+    typealias ServiceCapture = (FormattedText) async throws -> CapturedService
+    private lazy var account = ChatGPTAccount()
+    private lazy var gemini = GeminiAccount()
+    private lazy var model = suppliedModel ?? RewriteModel(account: account, gemini: gemini)
+    private let suppliedModel: RewriteModel?
+    private let suppliedServiceCapture: ServiceCapture?
     private var preview: NSWindow?
     private var settings: NSWindow?
     private var statusItem: NSStatusItem?
     private let shortcut = GlobalShortcut()
     private var serviceActive = false
-    private var serviceResult: String?
-    private var serviceTimer: Timer?
+    private var sourceApplication: NSRunningApplication?
+    private let captureLog = Logger(subsystem: "local.grammy.app", category: "capture")
+
+    init(model: RewriteModel? = nil, serviceCapture: ServiceCapture? = nil) {
+        suppliedModel = model
+        suppliedServiceCapture = serviceCapture
+        super.init()
+        self.model.cancelAction = { [weak self] in self?.dismissPreview() }
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        if let app = NSWorkspace.shared.frontmostApplication,
+           app.processIdentifier != ProcessInfo.processInfo.processIdentifier { sourceApplication = app }
+        NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(applicationActivated(_:)),
+            name: NSWorkspace.didActivateApplicationNotification, object: nil)
         setUpMenus()
         NSApp.servicesProvider = self
+        NSUpdateDynamicServices()
         shortcut.action = { [weak self] in self?.improveSelection() }
         if !shortcut.register() { account.message = "The global shortcut is already in use. Use Services, or paste a message into Grammy." }
-        model.cancelAction = { [weak self] in self?.dismissPreview() }
         if CommandLine.arguments.contains("--sample") { showSample() }
         else { showSettings() }
     }
@@ -42,35 +59,66 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     func applicationWillTerminate(_ notification: Notification) { model.stop(); account.cancelSignIn() }
 
-    @objc(improveSlackMessage:userData:error:)
-    func improveSlackMessage(_ pasteboard: NSPasteboard, userData: String?, error: AutoreleasingUnsafeMutablePointer<NSString?>) {
+    @objc private func applicationActivated(_ notification: Notification) {
+        guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+              app.processIdentifier != ProcessInfo.processInfo.processIdentifier else { return }
+        sourceApplication = app
+    }
+
+    @objc(improveMessage:userData:error:)
+    func improveMessage(_ pasteboard: NSPasteboard, userData: String?, error serviceError: AutoreleasingUnsafeMutablePointer<NSString?>) {
+        // This is an input-only Service. Native return types would let Electron
+        // replace the selection before the async preview or Copy has completed.
+        // Leave the input board untouched, including on rejected requests.
+        captureLog.notice("Services request received")
+        let text = FormattedText.read(pasteboard)
         guard !serviceActive, !model.isBusy, !model.isReplacing, preview?.isVisible != true else {
-            error.pointee = "Finish or cancel the current Grammy preview first."; return
+            serviceError.pointee = "Finish or cancel the current Grammy preview first."; return
         }
-        guard let text = pasteboard.string(forType: .string), !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            error.pointee = "Select some text to improve."; return
+        guard let text, !text.string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            serviceError.pointee = "Select some text to improve."; return
         }
-        serviceActive = true; serviceResult = nil
-        model.prepare(text, source: "Selected text") { [weak self] replacement in
-            self?.serviceResult = replacement
-            self?.dismissPreview()
+        serviceActive = true
+        // Return before copying: Electron can block Copy while waiting for a
+        // Services reply. Remember the source because Grammy may already be active.
+        let frontmost = NSWorkspace.shared.frontmostApplication
+        let source = frontmost?.processIdentifier == ProcessInfo.processInfo.processIdentifier ? sourceApplication : frontmost
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.serviceActive = false }
+            do {
+                let captured: CapturedService
+                if let capture = self.suppliedServiceCapture {
+                    captured = try await capture(text)
+                } else {
+                    guard AXIsProcessTrusted() else {
+                        throw GrammyError("Enable Grammy's Accessibility permission to capture emojis and replace the selected text.")
+                    }
+                    let target = try TextTarget.captureServiceInput(text, preferred: source)
+                    let formatted = try await target.copySelection()
+                    captured = (formatted, target.app.localizedName ?? "Selected text", { try await target.replace(with: $0) })
+                }
+                self.captureLog.notice("Formatted selection captured")
+                self.model.prepare(captured.text, source: captured.source) { [weak self] replacement in
+                    try await captured.replace(replacement)
+                    self?.dismissPreview()
+                }
+                self.showPreview()
+                self.model.generate()
+            } catch {
+                self.captureLog.notice("Services capture failed")
+                self.model.prepare(text, source: "Selected text")
+                self.showPreview()
+                // Preserve the capture failure instead of masking it with a
+                // generic missing-emoji error from the lossy Services input.
+                if (try? Rewrite.validateInput(text.modelText)) != nil {
+                    self.model.generate()
+                    self.model.error = error.localizedDescription + " You can still copy a complete suggestion."
+                } else {
+                    self.model.error = error.localizedDescription + " The editor's Services text is incomplete. Select the message again."
+                }
+            }
         }
-        showPreview()
-        // Native Services holds the source selection for this modal transaction. End before NSTimeout.
-        let timer = Timer(timeInterval: 240, repeats: false) { [weak self] _ in
-            Task { @MainActor in self?.model.cancel() }
-        }
-        serviceTimer = timer
-        RunLoop.main.add(timer, forMode: .common)
-        model.generate()
-        NSApp.runModal(for: preview!)
-        timer.invalidate(); serviceTimer = nil
-        model.stop()
-        serviceActive = false
-        pasteboard.clearContents()
-        if let serviceResult { pasteboard.setString(serviceResult, forType: .string) }
-        self.serviceResult = nil
-        model.replaceAction = nil; model.hasTarget = false
     }
 
     private func showPreview() {
@@ -90,10 +138,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     @objc private func showSettings() {
-        if serviceActive {
-            // End the service transaction before opening another window, keeping the draft unchanged.
-            dismissPreview()
-        }
         if settings == nil {
             let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 580, height: 640),
                                   styleMask: [.titled, .closable], backing: .buffered, defer: false)
@@ -121,20 +165,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         guard !serviceActive && !model.isBusy && !model.isReplacing else { NSSound.beep(); return }
         do {
             let target = try TextTarget.capture()
-            model.prepare(target.original, source: target.app.localizedName ?? "Selected text") { [weak self] replacement in
-                try await target.replace(with: replacement)
-                self?.dismissPreview()
-            }
-            showPreview(); model.generate()
+            improveCopiedSelection(target)
         } catch {
             model.prepare("", source: "Your message")
             model.error = error.localizedDescription
             showPreview()
         }
     }
+    private func improveCopiedSelection(_ target: TextTarget) {
+        serviceActive = true
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.serviceActive = false }
+            do {
+                try await self.prepareSelection(target)
+            } catch {
+                self.model.prepare("", source: "Your message")
+                self.model.error = error.localizedDescription
+                self.showPreview()
+            }
+        }
+    }
+    private func prepareSelection(_ target: TextTarget) async throws {
+        let text = try await target.copySelection()
+        model.prepare(text, source: target.app.localizedName ?? "Selected text") { [weak self] replacement in
+            try await target.replace(with: replacement)
+            self?.dismissPreview()
+        }
+        showPreview()
+        model.generate()
+    }
     private func dismissPreview() {
         model.stop()
-        if serviceActive { NSApp.stopModal() }
         preview?.orderOut(nil)
     }
     func windowShouldClose(_ sender: NSWindow) -> Bool {

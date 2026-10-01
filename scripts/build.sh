@@ -14,9 +14,25 @@ grammy_bundle="$PWD/dist/Grammy.app"
 mkdir -p "$grammy_bundle/Contents/MacOS" "$grammy_bundle/Contents/Resources"
 cp "$grammy_bin_dir/Grammy" "$grammy_bundle/Contents/MacOS/Grammy"
 cp Resources/Info.plist "$grammy_bundle/Contents/Info.plist"
-if [[ -n "${GRAMMY_SIGNING_IDENTITY:-}" ]]; then
-    codesign --force --options runtime --timestamp --sign "$GRAMMY_SIGNING_IDENTITY" "$grammy_bundle"
+# Reuse the sole Developer ID identity when available, so rebuilds keep the
+# same designated requirement and do not invalidate Accessibility grants.
+grammy_identity="${GRAMMY_SIGNING_IDENTITY:-}"
+if [[ -z "$grammy_identity" ]]; then
+    grammy_identities=()
+    while IFS= read -r grammy_candidate; do
+        [[ -z "$grammy_candidate" ]] || grammy_identities+=("$grammy_candidate")
+    done < <(security find-identity -v -p codesigning | awk -F '\"' '/Developer ID Application:/ {print $2}')
+    if [[ ${#grammy_identities[@]} -eq 1 ]]; then
+        grammy_identity="${grammy_identities[0]}"
+    elif [[ ${#grammy_identities[@]} -gt 1 ]]; then
+        printf 'Multiple Developer ID identities found. Set GRAMMY_SIGNING_IDENTITY to choose one.\n' >&2
+        exit 1
+    fi
+fi
+if [[ -n "$grammy_identity" ]]; then
+    codesign --force --options runtime --timestamp --sign "$grammy_identity" "$grammy_bundle"
 else
+    printf 'No Developer ID signing identity found; Accessibility may need refreshing after each rebuild.\n' >&2
     codesign --force --sign - "$grammy_bundle"
 fi
 codesign --verify --strict "$grammy_bundle"

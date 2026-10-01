@@ -14,12 +14,15 @@ final class RewriteModel: ObservableObject {
     @Published var hasTarget = false
     @Published var providerName = ""
     @Published var usedFallback = false
-    var replaceAction: ((String) async throws -> Void)?
+    var originalFormat = FormattedText("")
+    var formattedSuggestion: FormattedText { (try? originalFormat.styled(suggestion)) ?? FormattedText(suggestion) }
+    var replaceAction: ((FormattedText) async throws -> Void)?
     var cancelAction: (() -> Void)?
     private var task: Task<Void, Never>?
     private var generation = UUID()
-    private let account: ChatGPTAccount
-    private let gemini: GeminiAccount
+    private let account: ChatGPTAccount?
+    private let gemini: GeminiAccount?
+    private let rewrite: ((String, String?) async throws -> String)?
     private let session: URLSession = {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = 60
@@ -27,25 +30,46 @@ final class RewriteModel: ObservableObject {
         return URLSession(configuration: configuration)
     }()
 
-    init(account: ChatGPTAccount, gemini: GeminiAccount) { self.account = account; self.gemini = gemini }
-    var canAccept: Bool { isComplete && !isBusy && !isReplacing && (try? Rewrite.validate(original: original, candidate: suggestion)) != nil }
+    init(account: ChatGPTAccount, gemini: GeminiAccount) {
+        self.account = account; self.gemini = gemini; rewrite = nil
+    }
+    init(rewrite: @escaping (String, String?) async throws -> String) {
+        account = nil; gemini = nil; self.rewrite = rewrite
+    }
+    var canAccept: Bool { isComplete && !isBusy && !isReplacing && (try? validateSuggestion()) != nil }
     var emojiWarning: String? {
         guard isComplete else { return nil }
-        do { try Rewrite.validate(original: original, candidate: suggestion); return nil }
+        do { try validateSuggestion(); return nil }
         catch { return error.localizedDescription }
     }
 
-    func prepare(_ text: String, source: String, replace: ((String) async throws -> Void)? = nil) {
+    private func validateSuggestion() throws {
+        try Rewrite.validate(original: original, candidate: suggestion)
+        _ = try originalFormat.styled(suggestion)
+    }
+
+    func prepare(_ text: String, source: String, replace: ((FormattedText) async throws -> Void)? = nil) {
+        prepare(FormattedText(text), source: source, replace: replace)
+    }
+    func prepare(_ text: FormattedText, source: String, replace: ((FormattedText) async throws -> Void)? = nil) {
         stop()
-        original = text; suggestion = ""; sourceName = source
+        originalFormat = text; original = text.string; suggestion = ""; sourceName = source
         isComplete = false; isSample = false; error = nil; providerName = ""; usedFallback = false
         hasTarget = replace != nil; replaceAction = replace
     }
 
+    func editOriginal(_ text: String) {
+        guard !hasTarget, !isBusy, !isReplacing, text != original else { return }
+        original = text; originalFormat = FormattedText(text)
+        isComplete = false; suggestion = ""; error = nil
+    }
+
     func generate() {
         guard !isBusy && !isReplacing else { return }
-        let original = self.original
-        let previous = isComplete && !isSample ? suggestion : nil
+        if originalFormat.string != original { originalFormat = FormattedText(original) }
+        let format = originalFormat
+        let original = format.modelText
+        let previous = isComplete && !isSample ? formattedSuggestion.modelText : nil
         isSample = false; isComplete = false; suggestion = ""; error = nil
         isBusy = true
         let id = UUID(); generation = id
@@ -55,30 +79,34 @@ final class RewriteModel: ObservableObject {
                 try Rewrite.validateInput(original)
                 providerName = "ChatGPT"; usedFallback = false
                 var fallback: (() async throws -> String)?
-                if gemini.canFallback {
-                    fallback = { [self] in
+                if let gemini, gemini.canFallback {
+                    fallback = {
                         guard gemini.canFallback else { throw GrammyError("Gemini fallback was disabled. Try again.") }
                         return try await gemini.rewrite(original: original, previous: previous)
                     }
                 }
-                let text = try await RewriteRouter.run(primary: { [self] in
-                    try await rewriteWithChatGPT(original: original, previous: previous, id: id)
-                }, fallback: fallback, onFallback: { [self] in
-                    suggestion = "" // Discard any partial ChatGPT output before trying Gemini.
-                    providerName = "Gemini 3.5 Flash-Lite"; usedFallback = true
-                })
+                let text: String
+                if let rewrite { text = try await rewrite(original, previous) }
+                else {
+                    text = try await RewriteRouter.run(primary: { [self] in
+                        try await rewriteWithChatGPT(original: original, previous: previous, id: id)
+                    }, fallback: fallback, onFallback: { [self] in
+                        suggestion = "" // Discard any partial ChatGPT output before trying Gemini.
+                        providerName = "Gemini 3.5 Flash-Lite"; usedFallback = true
+                    })
+                }
                 try Task.checkCancellation()
                 guard generation == id else { return }
-                suggestion = text
+                suggestion = try format.rewritten(text).string
                 isComplete = true
-                try Rewrite.validate(original: original, candidate: suggestion)
+                try validateSuggestion()
             } catch is CancellationError { }
             catch { if generation == id { self.error = error.localizedDescription } }
         }
     }
 
     private func rewriteWithChatGPT(original: String, previous: String?, id: UUID) async throws -> String {
-        guard account.isSignedIn else { throw ProviderUnavailable("ChatGPT is not connected.") }
+        guard let account, account.isSignedIn else { throw ProviderUnavailable("ChatGPT is not connected.") }
         if account.models.isEmpty { await account.loadModels() }
         guard !account.selectedModel.isEmpty else { throw ProviderUnavailable("No ChatGPT model is available. Check Settings.") }
         let body = try Rewrite.body(original: original, previous: previous, model: account.selectedModel)
@@ -129,20 +157,23 @@ final class RewriteModel: ObservableObject {
         isReplacing = true; error = nil
         task = Task {
             defer { isReplacing = false; task = nil }
-            do { try await replaceAction(suggestion) }
+            do { try await replaceAction(formattedSuggestion) }
             catch { self.error = error.localizedDescription }
         }
     }
     func copy() {
         guard canAccept else { return }
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(suggestion, forType: .string)
+        formattedSuggestion.write(to: .general)
     }
     func stop() { generation = UUID(); task?.cancel(); task = nil; isBusy = false; isReplacing = false }
     func cancel() { stop(); cancelAction?() }
     func sample() {
-        prepare("hey team, i wont be able to joins the standup today 😅\nwill share my updates here after lunch :thumbsup:", source: "Sample message")
-        suggestion = "Hey team, I won’t be able to join the standup today 😅\nI’ll share my updates here after lunch :thumbsup:"
+        let text = NSMutableAttributedString(string: "hey team, i wont be able to joins the standup today 😅\nplease keep stage and develop unchanged :thumbsup:")
+        for word in ["stage", "develop"] {
+            text.addAttribute(.font, value: NSFont.monospacedSystemFont(ofSize: 15, weight: .regular), range: (text.string as NSString).range(of: word))
+        }
+        prepare(FormattedText(text), source: "Sample message")
+        suggestion = "Hey team, I won’t be able to join the standup today 😅\nPlease keep stage and develop unchanged :thumbsup:"
         isSample = true; isComplete = true
     }
 }
