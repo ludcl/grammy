@@ -32,6 +32,24 @@ final class GeminiTests: XCTestCase {
         XCTAssertThrowsError(try Gemini.request(original: "hello", previous: nil, apiKey: "line\nbreak"))
     }
 
+    func testEchoFollowUpRequestsCorrectionsForBothProviders() throws {
+        let original = "I wont be joinning 🙂 keep `stage` unchanged"
+        let previous = original + "\n"
+        let instruction = Rewrite.followUpInstruction(original: original, previous: previous)
+        let gemini = try Gemini.request(original: original, previous: previous, apiKey: "test-key")
+        let geminiBody = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(gemini.httpBody)) as? [String: Any])
+        let contents = try XCTUnwrap(geminiBody["contents"] as? [[String: Any]])
+        XCTAssertEqual((contents[2]["parts"] as? [[String: String]])?.first?["text"], instruction)
+        let openAI = try Rewrite.body(original: original, previous: previous, model: "test")
+        let openAIBody = try XCTUnwrap(JSONSerialization.jsonObject(with: openAI) as? [String: Any])
+        let input = try XCTUnwrap(openAIBody["input"] as? [[String: String]])
+        XCTAssertEqual(input[0]["content"], original)
+        XCTAssertEqual(input[1]["content"], previous)
+        XCTAssertEqual(input[2]["content"], instruction)
+        XCTAssertNotEqual(instruction, Rewrite.alternativeInstruction)
+        XCTAssertEqual(Rewrite.followUpInstruction(original: original, previous: "I won't be joining 🙂 keep `stage` unchanged"), Rewrite.alternativeInstruction)
+    }
+
     func testCompleteResponseExcludesThoughtParts() throws {
         let json = #"{"candidates":[{"finishReason":"STOP","content":{"parts":[{"text":"Hidden reasoning","thought":true},{"text":"Hello "},{"text":"🙂"}]}}]}"#
         let result = try Gemini.response(Data(json.utf8), status: 200)

@@ -78,31 +78,52 @@ final class RewriteModel: ObservableObject {
             do {
                 try Rewrite.validateInput(original)
                 providerName = "ChatGPT"; usedFallback = false
-                var fallback: (() async throws -> String)?
-                if let gemini, gemini.canFallback {
-                    fallback = {
-                        guard gemini.canFallback else { throw GrammyError("Gemini fallback was disabled. Try again.") }
-                        return try await gemini.rewrite(original: original, previous: previous)
-                    }
-                }
-                let text: String
-                if let rewrite { text = try await rewrite(original, previous) }
-                else {
-                    text = try await RewriteRouter.run(primary: { [self] in
-                        try await rewriteWithChatGPT(original: original, previous: previous, id: id)
-                    }, fallback: fallback, onFallback: { [self] in
-                        suggestion = "" // Discard any partial ChatGPT output before trying Gemini.
-                        providerName = "Gemini 3.5 Flash-Lite"; usedFallback = true
-                    })
-                }
+                let text = try await requestSuggestion(original: original, previous: previous, id: id)
                 try Task.checkCancellation()
                 guard generation == id else { return }
-                suggestion = try format.rewritten(text).string
-                isComplete = true
+                try Rewrite.validate(original: original, candidate: text)
+                var candidate = try format.rewritten(text).string
+                // Some providers echo the first draft. Keep the preview busy and
+                // request one correction pass automatically, on the same provider.
+                if previous == nil,
+                   candidate.trimmingCharacters(in: .whitespacesAndNewlines) == format.string.trimmingCharacters(in: .whitespacesAndNewlines) {
+                    suggestion = ""
+                    let corrected = try await requestSuggestion(original: original, previous: text, id: id)
+                    try Task.checkCancellation()
+                    guard generation == id else { return }
+                    try Rewrite.validate(original: original, candidate: corrected)
+                    candidate = try format.rewritten(corrected).string
+                }
+                suggestion = candidate
                 try validateSuggestion()
+                isComplete = true
             } catch is CancellationError { }
             catch { if generation == id { self.error = error.localizedDescription } }
         }
+    }
+
+    private func requestSuggestion(original: String, previous: String?, id: UUID) async throws -> String {
+        try Task.checkCancellation()
+        guard generation == id else { throw CancellationError() }
+        if let rewrite { return try await rewrite(original, previous) }
+        // An automatic correction pass should not repeat a failed ChatGPT request.
+        if usedFallback {
+            guard let gemini, gemini.canFallback else { throw GrammyError("Gemini fallback was disabled. Try again.") }
+            return try await gemini.rewrite(original: original, previous: previous)
+        }
+        var fallback: (() async throws -> String)?
+        if let gemini, gemini.canFallback {
+            fallback = {
+                guard gemini.canFallback else { throw GrammyError("Gemini fallback was disabled. Try again.") }
+                return try await gemini.rewrite(original: original, previous: previous)
+            }
+        }
+        return try await RewriteRouter.run(primary: { [self] in
+            try await rewriteWithChatGPT(original: original, previous: previous, id: id)
+        }, fallback: fallback, onFallback: { [self] in
+            suggestion = "" // Discard any partial ChatGPT output before trying Gemini.
+            providerName = "Gemini 3.5 Flash-Lite"; usedFallback = true
+        })
     }
 
     private func rewriteWithChatGPT(original: String, previous: String?, id: UUID) async throws -> String {
